@@ -1,0 +1,36 @@
+[package]
+name = "stage-alts"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[package.metadata.skyline]
+titleid = "01006A800016E000" # Smash Ultimate
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+skyline = { path = "../skyline-rs" }
+smash-arc = { version = "0.5", features = ["rust-zstd", "smash-runtime", "serialize"] }
+smash = { git = "https://github.com/blu-dev/smash-rs" }
+once_cell = "1"
+ninput = { git = "https://github.com/blu-dev/ninput" }
+serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
+skyline-web = { git = "https://github.com/skyline-rs/skyline-web" }
+rlua-lua53-sys = { path = "../rlua/crates/rlua-lua53-sys" }
+prc-rs = { git = "https://github.com/ultimate-research/prc-rs", features = ["indexmap-std"] }
+parking_lot = "0.12"
+rand = { git = "https://github.com/skyline-rs/rand" }
+
+[patch.crates-io]
+getrandom = { git = "https://github.com/skyline-rs/getrandom" }
+
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

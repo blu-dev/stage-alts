@@ -1,0 +1,4 @@
+{
+    "rust-analyzer.checkOnSave.command": "clippy",
+    "rust-analyzer.server.extraEnv": {"RUSTFLAGS" : "--cfg skyline_std_v3"}
+}
