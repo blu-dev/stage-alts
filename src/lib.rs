@@ -1,150 +1,52 @@
 #![feature(let_else)]
-
-use std::collections::HashMap;
+#![feature(label_break_value)]
+use std::{collections::HashMap, sync::atomic::Ordering};
 
 use containers::{LoadInfo, LoadType};
+use log::error;
 use once_cell::sync::Lazy;
 use rand::{thread_rng, RngCore};
 use skyline::hooks::InlineCtx;
-use smash_arc::{ArcLookup, Hash40, PathListEntry, SearchLookup};
+use smash_arc::{ArcLookup, FilePath, Hash40, PathListEntry, SearchLookup};
 use types::{FilesystemInfo, LoadedDirectory, ResServiceNX};
 
+mod alts;
 mod containers;
+#[cfg(feature = "logger")]
+mod logger;
 mod lua;
 mod search;
 mod types;
 
-pub struct StageAltFolder {
-    alt_no: usize,
-    base_path: Hash40,
-    new_path: Hash40,
-    files: Vec<Hash40>,
-}
-
-impl StageAltFolder {
-    pub fn new<H: Into<Hash40>, H2: Into<Hash40>>(alt_no: usize, base: H, new: H2) -> Self {
-        Self {
-            alt_no,
-            base_path: base.into(),
-            new_path: new.into(),
-            files: Vec::new(),
-        }
-    }
-
-    pub fn add_file<H: Into<Hash40>>(&mut self, name: H) {
-        self.files.push(name.into());
-    }
-
-    pub fn base_path(&self, name: Hash40) -> Hash40 {
-        Hash40(
-            smash::phx::Hash40::new_raw(self.base_path.0)
-                .concat(smash::phx::Hash40::new("/"))
-                .concat(smash::phx::Hash40::new_raw(name.0))
-                .as_u64(),
-        )
-    }
-
-    pub fn new_path(&self, name: Hash40) -> Hash40 {
-        Hash40(
-            smash::phx::Hash40::new_raw(self.new_path.0)
-                .concat(smash::phx::Hash40::new("/"))
-                .concat(smash::phx::Hash40::new_raw(name.0))
-                .as_u64(),
-        )
-    }
-
-    pub fn files(&self) -> &Vec<Hash40> {
-        &self.files
+#[macro_export]
+macro_rules! hash40_fmt {
+    ($str:expr $(, $args:expr)*) => {
+        Hash40::from(format!($str $(, $args)*).as_str())
     }
 }
 
-pub struct StageAlts {
-    folders: HashMap<Hash40, Vec<StageAltFolder>>,
-    available_normal: HashMap<Hash40, usize>,
-    available_battle: HashMap<Hash40, usize>,
+trait Hash40Ext: Sized {
+    fn concat<H: Into<Self>>(self, other: H) -> Self;
+    fn join_path<H: Into<Self>>(self, other: H) -> Self;
 }
 
-impl StageAlts {
-    pub fn new() -> Self {
-        Self {
-            folders: HashMap::new(),
-            available_normal: HashMap::new(),
-            available_battle: HashMap::new(),
-        }
+impl Hash40Ext for Hash40 {
+    fn concat<H: Into<Self>>(self, other: H) -> Self {
+        let raw = smash::phx::Hash40::new_raw(self.as_u64())
+            .concat(smash::phx::Hash40::new_raw(other.into().as_u64()))
+            .as_u64();
+
+        Self(raw)
     }
 
-    pub fn add_alt(&mut self, base_path: Hash40, alt: StageAltFolder) {
-        if let Some(alts) = self.folders.get_mut(&base_path) {
-            alts.push(alt);
-        } else {
-            self.folders.insert(base_path, vec![alt]);
-        }
-    }
-
-    pub fn get_alt(&self, path: Hash40, alt_no: usize) -> Option<&StageAltFolder> {
-        let alts = self.folders.get(&path)?;
-
-        for alt in alts.iter() {
-            if alt.alt_no == alt_no {
-                return Some(alt);
-            }
-        }
-
-        None
-    }
-
-    pub fn set_available_normal(&mut self, path: Hash40, available: usize) {
-        self.available_normal.insert(path, available);
-    }
-
-    pub fn is_available_normal(&self, path: Hash40, what: usize) -> bool {
-        if let Some(max) = self.available_normal.get(&path) {
-            what < *max
-        } else {
-            false
-        }
-    }
-
-    pub fn set_available_battle(&mut self, path: Hash40, available: usize) {
-        self.available_battle.insert(path, available);
-    }
-
-    pub fn is_available_battle(&self, path: Hash40, what: usize) -> bool {
-        if let Some(max) = self.available_battle.get(&path) {
-            what < *max
-        } else {
-            false
-        }
-    }
-
-    pub fn max_normal(&self, path: Hash40) -> usize {
-        self.available_normal.get(&path).copied().unwrap_or(0)
-    }
-
-    pub fn max_battle(&self, path: Hash40) -> usize {
-        self.available_battle.get(&path).copied().unwrap_or(0)
+    fn join_path<H: Into<Self>>(self, other: H) -> Self {
+        self.concat("/").concat(other)
     }
 }
-
-impl Default for StageAlts {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-static STAGE_ALT_LOOKUP: Lazy<StageAlts> = Lazy::new(search::collect_stage_alts);
 
 extern "C" {
     fn res_loop_start(ctx: &InlineCtx);
     fn initial_loading(ctx: &InlineCtx);
-}
-
-#[skyline::hook(replace = initial_loading)]
-unsafe fn initial_loading_hook(ctx: &InlineCtx) {
-    call_original!(ctx);
-    Lazy::force(&STAGE_ALT_LOOKUP);
-    Lazy::force(&lua::UI_TO_HASH_LOOKUP);
-    Lazy::force(&lua::UI_FILEPATH_INDICES);
 }
 
 #[skyline::from_offset(0x353fa20)]
@@ -153,8 +55,19 @@ pub unsafe fn refc(table: &'static FilesystemInfo, index: u32);
 #[skyline::from_offset(0x353fb30)]
 pub unsafe fn unrefc(table: &'static FilesystemInfo, index: u32);
 
+#[skyline::from_offset(0x35455d0)]
+pub unsafe fn add_to_res_list(res_service: &'static ResServiceNX, index: u32, list_index: u32);
+
 static mut CURRENT_STAGE_INDEX: usize = 0;
 static mut INCOMING_RANDOM: usize = 0;
+
+#[skyline::hook(replace = initial_loading)]
+unsafe fn initial_loading_hook(ctx: &InlineCtx) {
+    call_original!(ctx);
+
+    Lazy::force(&lua::UI_TO_HASH_LOOKUP);
+    search::collect_alts();
+}
 
 #[skyline::hook(offset = 0x353fe30)]
 unsafe fn init_loaded_dir(info: &'static FilesystemInfo, index: u32) -> *mut LoadedDirectory {
@@ -168,31 +81,57 @@ unsafe fn init_loaded_dir(info: &'static FilesystemInfo, index: u32) -> *mut Loa
 
     let Some(dir) = info.arc().get_dir_infos().get(index as usize) else { return result; };
 
-    let mut alt_no = lua::INCOMING_ALTS[CURRENT_STAGE_INDEX];
+    let mgr = alts::get();
 
-    if alt_no == usize::MAX || alt_no == usize::MAX - 1 {
-        alt_no = INCOMING_RANDOM;
+    if !mgr.does_current_alt_have_folder(dir.path.hash40()) {
+        log::info!("Alt does not have folder {:#x}", dir.path.hash40().0);
+        return result;
     }
 
-    if let Some(alt) = STAGE_ALT_LOOKUP.get_alt(dir.path.hash40(), alt_no) {
-        for child in loaded_directory.child_path_indices.iter() {
-            unrefc(info, *child);
-        }
-        loaded_directory.child_path_indices.clear();
+    log::info!("Current alt has folder {:#x}!", dir.path.hash40().0);
 
-        for child in alt.files() {
-            let child = alt.new_path(*child);
+    let Some(files) = mgr.get_files_for_alt_folder(dir.path.hash40()) else {
+        error!("Current alt should have folder {:#x} but it was not found in the search section! Perhaps the config is incorrect?", dir.path.hash40().0);
+        return result;
+    };
 
-            println!("{:#X} child: {:#x}", dir.path.hash40().0, child.0);
-            let path_index = info.arc().get_file_path_index_from_hash(child).unwrap().0;
+    let arc = info.arc();
+    let file_paths = arc.get_file_paths();
 
-            loaded_directory.child_path_indices.push(path_index);
-            refc(info, path_index);
-        }
+    let sharing_base = mgr
+        .get_sharing_base_for_alt_folder(dir.path.hash40())
+        .unwrap();
+
+    for child in loaded_directory.child_path_indices.iter() {
+        unrefc(info, *child);
+        // if info.get_loaded_datas()
+        //     [info.get_loaded_filepaths()[*child as usize].loaded_data_index as usize]
+        //     .ref_count
+        //     .load(Ordering::SeqCst)
+        //     == 0
+        // {
+        //     if let Some((_, modded)) = sharing_base.get(&file_paths[*child as usize].path.hash40())
+        //     {
+        //         (*(arc.file_paths as *mut FilePath).add(*child as usize))
+        //             .path
+        //             .set_index(*modded);
+        //     }
+        // }
+    }
+
+    loaded_directory.child_path_indices.clear();
+
+    for file in files {
+        loaded_directory.child_path_indices.push(file.0);
+        refc(info, file.0);
+        add_to_res_list(ResServiceNX::instance().unwrap(), file.0, 0);
     }
 
     result
 }
+
+#[skyline::hook(offset = 0x353e5c0)]
+unsafe fn uninit_loaded_dir(info: &'static FilesystemInfo, dir: *mut LoadedDirectory) {}
 
 #[skyline::hook(replace = res_loop_start)]
 unsafe fn res_loop_start_hook(ctx: &InlineCtx) {
@@ -207,14 +146,18 @@ unsafe fn res_loop_start_hook(ctx: &InlineCtx) {
             if let LoadType::Directory = entry.ty {
                 let loaded_dir = &info.get_loaded_directories()[entry.directory_index as usize];
 
+                // let Some(dir_info_name) = arc.get_dir_infos().get(loaded_dir.file_group_index as usize).map(|info| info.path.hash40()) else {
+                //     continue;
+                // };
+
                 for file in loaded_dir.child_path_indices.iter() {
                     let info_index = arc.get_file_info_indices()
                         [arc.get_file_paths()[*file as usize].path.index() as usize]
                         .file_info_index;
                     let info = &arc.get_file_infos()[info_index];
 
-                    if info.flags.unused4() & 1 != 0 {
-                        loads[list_idx].push(*file);
+                    if info.flags.unused4() & 5 != 0 {
+                        loads[list_idx].push(info.file_path_index.0);
                     }
                 }
             }
@@ -223,6 +166,7 @@ unsafe fn res_loop_start_hook(ctx: &InlineCtx) {
 
     for (idx, load) in loads.into_iter().enumerate() {
         for load in load {
+            log::info!("Adding {:#x} to load list", load);
             service.res_lists[idx].insert(LoadInfo {
                 ty: LoadType::File,
                 filepath_index: load,
@@ -237,138 +181,69 @@ unsafe fn res_loop_start_hook(ctx: &InlineCtx) {
 
 #[skyline::hook(offset = 0x25fd2b8, inline)]
 unsafe fn prepare_for_load(ctx: &skyline::hooks::InlineCtx) {
-    if CURRENT_STAGE_INDEX == usize::MAX {
-        CURRENT_STAGE_INDEX = 0;
-    } else {
-        CURRENT_STAGE_INDEX = (CURRENT_STAGE_INDEX + 1) % 3;
-    }
-
-    if lua::INCOMING_ALTS[CURRENT_STAGE_INDEX] == usize::MAX {
-        let search = FilesystemInfo::instance().unwrap().search();
-
-        let Ok(path) = search.get_path_list_entry_from_hash(*ctx.registers[8].x.as_ref()) else {
-            return;
-        };
-
-        let Ok(path) = search.get_path_list_entry_from_hash(path.parent.hash40()) else {
-            return;
-        };
-
-        let max = STAGE_ALT_LOOKUP.max_normal(path.file_name.hash40());
-        INCOMING_RANDOM = if max == 0 {
-            0
-        } else {
-            (thread_rng().next_u64() % (max as u64)) as usize
-        };
-    } else if lua::INCOMING_ALTS[CURRENT_STAGE_INDEX] == usize::MAX - 1 {
-        let search = FilesystemInfo::instance().unwrap().search();
-
-        let Ok(path) = search.get_path_list_entry_from_hash(*ctx.registers[8].x.as_ref()) else {
-            return;
-        };
-
-        let Ok(path) = search.get_path_list_entry_from_hash(path.parent.hash40()) else {
-            return;
-        };
-
-        let max = STAGE_ALT_LOOKUP.max_battle(path.file_name.hash40());
-        INCOMING_RANDOM = if max == 0 {
-            0
-        } else {
-            (thread_rng().next_u64() % (max as u64)) as usize
-        };
-    }
-}
-
-extern "C" {
-    fn check_extension_eff_inline_hook(ctx: &InlineCtx);
-}
-
-unsafe fn check_extension_common(ctx: &mut InlineCtx) -> bool {
-    let eff_hash = Hash40::from("eff");
-
-    // get the path list entry from x8
-    let path_list_entry: &PathListEntry = &*(*ctx.registers[8].x.as_ref() as *const PathListEntry);
-
-    // satisfy post conditions before doing fighter only block
-    *ctx.registers[8].x.as_mut() = if path_list_entry.ext.hash40() == eff_hash {
-        0
-    } else {
-        1
+    let search = FilesystemInfo::instance().unwrap().search();
+    let Ok(path) = search.get_path_list_entry_from_hash(*ctx.registers[8].x.as_ref()) else {
+        error!("Failed to get the path list entry from {:#x}", *ctx.registers[8].x.as_ref());
+        return;
     };
-    *ctx.registers[9].x.as_mut() = eff_hash.as_u64();
 
-    println!(
-        "{:#x}: {:#X}",
-        *ctx.registers[26].w.as_ref(),
-        path_list_entry.path.hash40().0
+    let Ok(parent_path) = search.get_path_list_entry_from_hash(path.parent.hash40()) else {
+        error!("Failed to get the parent of the path {:#x}", path.path.hash40().0);
+        return;
+    };
+
+    let mut mgr = alts::get_mut();
+
+    mgr.advance_alt(
+        parent_path.file_name.hash40(),
+        path.file_name.hash40() != Hash40::from("normal")
+            && parent_path.file_name.hash40() != Hash40::from("end"),
     );
-
-    // Don't bother checking if the extension is not eff
-    if *ctx.registers[8].x.as_ref() != 0 {
-        return true;
-    }
-
-    let Some(alt) = STAGE_ALT_LOOKUP.get_alt(path_list_entry.parent.hash40(), lua::INCOMING_ALTS[CURRENT_STAGE_INDEX]) else {
-        return true;
-    };
-
-    if alt.files.contains(&path_list_entry.file_name.hash40()) {
-        *ctx.registers[8].x.as_mut() = 0;
-        false
-    } else {
-        *ctx.registers[8].x.as_mut() = 1;
-        true
-    }
 }
 
-#[skyline::hook(replace = check_extension_eff_inline_hook)]
-unsafe fn check_extension_eff_inline_hook_hook(ctx: &mut InlineCtx) {
-    if check_extension_common(ctx) {
-        call_original!(ctx);
-    }
+#[skyline::hook(offset = 0x22d91f0, inline)]
+unsafe fn online_melee_any_scene_create(_: &InlineCtx) {
+    let mut mgr = alts::get_mut();
+    mgr.is_online = true;
 }
 
-#[skyline::hook(offset = 0x355f66c, inline)]
-unsafe fn check_extension_hook(ctx: &mut InlineCtx) {
-    check_extension_common(ctx);
+#[skyline::hook(offset = 0x22d9120, inline)]
+unsafe fn bg_matchmaking_seq(_: &InlineCtx) {
+    let mut mgr = alts::get_mut();
+    mgr.is_online = true;
 }
 
-const AARCh264_NOP: u32 = 0xD503201F;
+#[skyline::hook(offset = 0x22d9050, inline)]
+unsafe fn arena_seq(_: &InlineCtx) {
+    let mut mgr = alts::get_mut();
+    mgr.is_online = true;
+}
+
+#[skyline::hook(offset = 0x23599ac, inline)]
+unsafe fn main_menu(_: &InlineCtx) {
+    let mut mgr = alts::get_mut();
+    mgr.selection = vec![];
+    mgr.current_index = 0;
+    mgr.is_online = false;
+}
 
 #[skyline::main(name = "stage-alts")]
 pub fn main() {
+    #[cfg(feature = "logger")]
+    {
+        logger::init();
+    }
+
     skyline::install_hooks!(
         res_loop_start_hook,
         init_loaded_dir,
         initial_loading_hook,
         prepare_for_load,
+        online_melee_any_scene_create,
+        bg_matchmaking_seq,
+        arena_seq,
+        main_menu
     );
-
-    let is_one_slot_eff_present = unsafe {
-        let mut out = 0;
-        skyline::nn::ro::LookupSymbol(&mut out, "check_extension_eff_inline_hook\0".as_ptr() as _);
-        out != 0
-    };
-
-    if !is_one_slot_eff_present {
-        unsafe {
-            let _ = skyline::patching::patch_data(
-                0x355f66c,
-                &[
-                    AARCh264_NOP,
-                    AARCh264_NOP,
-                    AARCh264_NOP,
-                    AARCh264_NOP,
-                    AARCh264_NOP,
-                    AARCh264_NOP,
-                ],
-            );
-        }
-        skyline::install_hook!(check_extension_hook);
-    } else {
-        skyline::install_hook!(check_extension_eff_inline_hook_hook);
-    }
 
     lua::install();
 }

@@ -1,13 +1,17 @@
 use std::{collections::HashMap, path::Path};
 
+use log::{error, info};
 use once_cell::sync::Lazy;
 use prc::ParamKind;
 use rlua_lua53_sys as lua;
-use smash_arc::{Hash40, ArcLookup, FilePathIdx};
+use smash_arc::{ArcLookup, FilePathIdx, Hash40};
 
 use parking_lot::Mutex;
 
-use crate::{STAGE_ALT_LOOKUP, types::FilesystemInfo};
+use crate::{
+    alts::{self, Selection, STAGE_ALT_MANAGER},
+    types::FilesystemInfo,
+};
 
 pub static UI_TO_HASH_LOOKUP: Lazy<HashMap<Hash40, Hash40>> = Lazy::new(|| {
     let data = if Path::new("mods:/ui/param/database/ui_stage_db.prc").exists() {
@@ -51,46 +55,15 @@ pub static UI_TO_HASH_LOOKUP: Lazy<HashMap<Hash40, Hash40>> = Lazy::new(|| {
     map
 });
 
-static PANEL_TO_HASH_LOOKUP2: Lazy<Mutex<HashMap<usize, Hash40>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-
-pub static UI_FILEPATH_INDICES: Lazy<Vec<u32>> = Lazy::new(|| {
-    let hashes = UI_TO_HASH_LOOKUP
-        .iter()
-        .map(|(_, place)| *place);
-
-    let info = FilesystemInfo::instance().unwrap();
-    let arc = info.arc();
-    let mut indices = vec![];
-    for hash in hashes {
-        // normal
-        let mut counter = 1;
-        while let Ok(index) = arc.get_file_path_index_from_hash(format_path_for_ui(hash, 0, counter)) {
-            indices.push(index.0);
-            counter += 1;
-        }
-        // battle
-        let mut counter = 1;
-        while let Ok(index) = arc.get_file_path_index_from_hash(format_path_for_ui(hash, 2, counter)) {
-            indices.push(index.0);
-            counter += 1;
-        }
-        // omega
-        let mut counter = 1;
-        while let Ok(index) = arc.get_file_path_index_from_hash(format_path_for_ui(hash, 1, counter)) {
-            indices.push(index.0);
-            counter += 1;
-        }
-    }
-
-    indices
-});
+static PANEL_TO_HASH_LOOKUP2: Lazy<Mutex<HashMap<usize, Hash40>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 // pub static mut INCOMING_ALT_NO: usize = 0;
 pub static mut INCOMING_ALTS: [usize; 3] = [0; 3];
 
 extern "C" fn register_alt(state: *mut lua::lua_State) -> i32 {
     unsafe {
-        let mut alt_no = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as usize;
+        let alt_no = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as usize;
         lua::lua_pop(state, 1);
 
         let panel_id = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
@@ -99,19 +72,49 @@ extern "C" fn register_alt(state: *mut lua::lua_State) -> i32 {
         let preview_id = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
         lua::lua_pop(state, 1);
 
-        let ui_hash = PANEL_TO_HASH_LOOKUP2.lock().get(&(panel_id as usize)).copied();
-        println!("{:#x?}", ui_hash);
-        if let Some(ui_hash) = ui_hash {
-            if ui_hash == Hash40::from("ui_stage_random")
-            || ui_hash == Hash40::from("ui_stage_random_normal") {
-                alt_no = usize::MAX;
-            } else if ui_hash == Hash40::from("ui_stage_random_battle")
-            || ui_hash == Hash40::from("ui_stage_random_end") {
-                alt_no = usize::MAX - 1;
-            }
-        }
+        let ui_hash = PANEL_TO_HASH_LOOKUP2
+            .lock()
+            .get(&(panel_id as usize))
+            .copied();
 
-        INCOMING_ALTS[preview_id as usize] = alt_no;
+        let Some(ui_hash) = ui_hash else {
+            error!("There is no UI hash for the panel id {:#x}", panel_id);
+            return 0;
+        };
+
+        let mut mgr = alts::get_mut();
+
+        if [
+            Hash40::from("ui_stage_random"),
+            Hash40::from("ui_stage_random_normal"),
+            Hash40::from("ui_stage_random_battle"),
+            Hash40::from("ui_stage_random_end"),
+        ]
+        .contains(&ui_hash)
+        {
+            info!(
+                "Setting stage selection for preview id {} to random!",
+                preview_id
+            );
+            mgr.set_stage_selection(preview_id as usize, Selection::Random);
+        } else if let Some(stage_name) = UI_TO_HASH_LOOKUP.get(&ui_hash) {
+            info!(
+                "Setting stage selection for preview id {} to {:#x} @ {}!",
+                preview_id, stage_name.0, alt_no
+            );
+            mgr.set_stage_selection(
+                preview_id as usize,
+                Selection::Regular {
+                    name: *stage_name,
+                    alt: alt_no,
+                },
+            );
+        } else {
+            error!(
+                "Unable to get the stage name from the UI hash: {:#x}",
+                ui_hash.0
+            );
+        }
 
         0
     }
@@ -119,100 +122,74 @@ extern "C" fn register_alt(state: *mut lua::lua_State) -> i32 {
 
 extern "C" fn get_next_alt(state: *mut lua::lua_State) -> i32 {
     unsafe {
-        let alt_no = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
+        let stage_form = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
         lua::lua_pop(state, 1);
-        let mut stage_form = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
+        let alt_no = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
         lua::lua_pop(state, 1);
         let panel_id = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
         lua::lua_pop(state, 1);
 
         let panel_id = panel_id as usize;
 
-        println!("alt: {}, form: {}, panel: {}", alt_no, stage_form, panel_id);
-
         let panel_lookup = PANEL_TO_HASH_LOOKUP2.lock();
 
-        let stage_hash = panel_lookup
-            .get(&panel_id)
-            .and_then(|ui_hash| UI_TO_HASH_LOOKUP.get(ui_hash))
-            .copied();
+        let Some(ui_hash) = panel_lookup.get(&panel_id).copied() else {
+            error!("Failed to get the UI hash from panel id {:#x}", panel_id);
+            lua::lua_pushinteger(state, 0);
+            return 1;
+        };
 
-        if let Some(mut hash) = stage_hash {
-            if hash == Hash40::from("stage/end") {
-                stage_form = 0;
-            }
+        let Some(stage_hash) = UI_TO_HASH_LOOKUP.get(&ui_hash).copied() else {
+            error!("Failed to get the stage name from the UI hash {:#x}", ui_hash.0);
+            lua::lua_pushinteger(state, 0);
+            return 1;
+        };
 
-            if (hash == Hash40::from("stage/battlefield_s") || hash == Hash40::from("stage/battlefield_l"))
-            && stage_form != 0 {
-                hash = Hash40::from("stage/battlefield");
-                stage_form = 0;
-            }
-            if (stage_form == 0 && STAGE_ALT_LOOKUP.is_available_normal(hash, 1 + alt_no as usize))
-            || (stage_form != 0 && STAGE_ALT_LOOKUP.is_available_battle(hash, 1 + alt_no as usize)) {
-                lua::lua_pushinteger(state, 1 + alt_no as i64);
-            } else {
-                lua::lua_pushinteger(state, 0);
-            }
-        } else {
-            lua::lua_pushinteger(state, -1);
-        }
+        let mgr = alts::get();
+
+        info!("Getting the next alt for {:#x} @ {}", stage_hash.0, alt_no);
+        let next = mgr.get_next_alt(stage_hash, alt_no as usize, stage_form != 0);
+
+        lua::lua_pushinteger(state, next as i64);
 
         1
     }
 }
 
-fn format_path_for_ui(stage: Hash40, form: usize, alt: usize) -> Hash40 {
-    let dlc = &[
-        Hash40::from("battlefields"),
-        Hash40::from("brave_altar"),
-        Hash40::from("buddy_spiral"),
-        Hash40::from("demon_dojo"),
-        Hash40::from("dolly_stadium"),
-        Hash40::from("fe_shrine"),
-        Hash40::from("ff_cave"),
-        Hash40::from("jack_mementoes"),
-        Hash40::from("pickel_world"),
-        Hash40::from("tantan_spring"),
-        Hash40::from("xeno_alst"),
-        Hash40::from("trail_castle"),
-    ];
+extern "C" fn get_prev_alt(state: *mut lua::lua_State) -> i32 {
+    unsafe {
+        let stage_form = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
+        lua::lua_pop(state, 1);
+        let alt_no = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
+        lua::lua_pop(state, 1);
+        let panel_id = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
+        lua::lua_pop(state, 1);
 
-    let stage = if stage == Hash40::from("battlefield_l") {
-        Hash40::from("battlefieldl")
-    } else if stage == Hash40::from("battlefield_s") {
-        Hash40::from("battlefields")
-    } else {
-        stage
-    };
+        let panel_id = panel_id as usize;
 
-    let ui_folder = if !dlc.contains(&stage) {
-        match form {
-            0 => "ui/replace/stage/stage_2/stage_2_",
-            1 => "ui/replace/stage/stage_4/stage_4_",
-            2 => "ui/replace/stage/stage_3/stage_3_",
-            _ => return Hash40::from("")
-        }
-    } else {
-        match form {
-            0 => "ui/replace_patch/stage/stage_2/stage_2_",
-            1 => "ui/replace_patch/stage/stage_4/stage_4_",
-            2 => "ui/replace_patch/stage/stage_3/stage_3_",
-            _ => return Hash40::from("")
-        }
-    };
+        let panel_lookup = PANEL_TO_HASH_LOOKUP2.lock();
 
-    let suffix = if alt == 0 {
-        ".bntx".into()
-    } else {
-        format!("_s{:02}.bntx", alt)
-    };
+        let Some(ui_hash) = panel_lookup.get(&panel_id).copied() else {
+            error!("Failed to get the UI hash from panel id {:#x}", panel_id);
+            lua::lua_pushinteger(state, 0);
+            return 1;
+        };
 
+        let Some(stage_hash) = UI_TO_HASH_LOOKUP.get(&ui_hash).copied() else {
+            error!("Failed to get the stage name from the UI hash {:#x}", ui_hash.0);
+            lua::lua_pushinteger(state, 0);
+            return 1;
+        };
 
-    let full_path = smash::phx::Hash40::new(ui_folder)
-        .concat(smash::phx::Hash40::new_raw(stage.0))
-        .concat(smash::phx::Hash40::new(suffix));
+        let mgr = alts::get();
 
-    Hash40(full_path.as_u64())
+        info!("Getting the prev alt for {:#x} @ {}", stage_hash.0, alt_no);
+        let next = mgr.get_prev_alt(stage_hash, alt_no as usize, stage_form != 0);
+
+        lua::lua_pushinteger(state, next as i64);
+
+        1
+    }
 }
 
 extern "C" fn get_index_for_texture(state: *mut lua::lua_State) -> i32 {
@@ -229,26 +206,58 @@ extern "C" fn get_index_for_texture(state: *mut lua::lua_State) -> i32 {
         let arc = FilesystemInfo::instance().unwrap().arc();
         let panel_lookup = PANEL_TO_HASH_LOOKUP2.lock();
 
-        let stage_hash = panel_lookup
-            .get(&panel_id)
-            .and_then(|ui_hash| UI_TO_HASH_LOOKUP.get(ui_hash))
-            .copied();
+        let default_index = arc
+            .get_file_path_index_from_hash(Hash40::from(
+                "ui/replace/chara/chara_1/chara_1_wario_04.bntx",
+            ))
+            .unwrap();
 
-        let index = if let Some(mut hash) = stage_hash {
-            if (hash == Hash40::from("battlefield_s") || hash == Hash40::from("battlefield_l"))
-            && stage_form != 0 {
-                hash = Hash40::from("battlefield");
-            }
-            arc
-                .get_file_path_index_from_hash(format_path_for_ui(hash, stage_form as _, alt_no as _))
-                .or_else(|_| arc.get_file_path_index_from_hash(format_path_for_ui(hash, stage_form as _, 0)))
-                .unwrap_or(FilePathIdx(0xFF_FFFF))
-        } else {
-            FilePathIdx(0xFF_FFFF)
+        let Some(ui_hash) = panel_lookup.get(&panel_id).copied() else {
+            error!("Failed to get UI hash for panel id {}", panel_id);
+            lua::lua_pushinteger(state, default_index.0 as i64);
+            return 1;
         };
 
-        lua::lua_pushinteger(state, index.0 as _);
+        let Some(stage_name) = UI_TO_HASH_LOOKUP.get(&ui_hash).copied() else {
+            error!("Failed to get stage name from UI hash {:#x}", ui_hash.0);
+            lua::lua_pushinteger(state, default_index.0 as i64);
+            return 1;
+        };
 
+        let mgr = alts::get();
+
+        let path_hash = match stage_form {
+            0 => mgr.get_normal_ui_path(stage_name, alt_no as usize),
+            1 => mgr.get_battle_ui_path(stage_name, alt_no as usize),
+            2 => mgr.get_end_ui_path(stage_name, alt_no as usize),
+            form => {
+                error!(
+                    "Stage form {} is invalid in this context, unable to get UI index",
+                    form
+                );
+                lua::lua_pushinteger(state, default_index.0 as i64);
+                return 1;
+            }
+        };
+
+        let path_index = arc.get_file_path_index_from_hash(path_hash).map_or_else(
+            |_| {
+                error!(
+                    "Failed to get file path index from hash UI path hash {:#x}",
+                    path_hash.0
+                );
+                default_index
+            },
+            |index| {
+                info!(
+                    "Using file path index {:#x} for {:#x} @ alt#{} + form#{}",
+                    index.0, stage_name.0, alt_no, stage_form
+                );
+                index
+            },
+        );
+
+        lua::lua_pushinteger(state, path_index.0 as i64);
         1
     }
 }
@@ -264,26 +273,42 @@ extern "C" fn send_message(state: *mut lua::lua_State) -> i32 {
 
 extern "C" fn on_load(_state: *mut lua::lua_State) -> i32 {
     unsafe {
-        let info = FilesystemInfo::instance().unwrap();
-        for index in UI_FILEPATH_INDICES.iter() {
-            super::refc(info, *index);
-        }
+        // let info = FilesystemInfo::instance().unwrap();
+        // for index in UI_FILEPATH_INDICES.iter() {
+        //     super::refc(info, *index);
+        // }
+        let mut mgr = alts::get_mut();
+        mgr.current_index = 0;
         0
     }
 }
 
 extern "C" fn off_load(_state: *mut lua::lua_State) -> i32 {
     unsafe {
-        let info = FilesystemInfo::instance().unwrap();
-        for index in UI_FILEPATH_INDICES.iter() {
-            super::unrefc(info, *index);
-        }
+        // let info = FilesystemInfo::instance().unwrap();
+        // for index in UI_FILEPATH_INDICES.iter() {
+        //     super::unrefc(info, *index);
+        // }
+        let mgr = alts::get_mut();
         super::CURRENT_STAGE_INDEX = usize::MAX;
         0
     }
 }
 
-unsafe fn push_new_singleton(lua_state: *mut lua::lua_State, name: &'static str, registry: &[lua::luaL_Reg]) {
+extern "C" fn set_stage_use_num(state: *mut lua::lua_State) -> i32 {
+    unsafe {
+        let use_num = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
+        lua::lua_pop(state, 1);
+        alts::get_mut().set_stage_use_count(use_num as _);
+        0
+    }
+}
+
+unsafe fn push_new_singleton(
+    lua_state: *mut lua::lua_State,
+    name: &'static str,
+    registry: &[lua::luaL_Reg],
+) {
     let real_name = format!("{}\0", name);
     let meta_name = format!("Metatable{}\0", name);
     lua::luaL_newmetatable(lua_state, meta_name.as_ptr() as _);
@@ -296,7 +321,7 @@ unsafe fn push_new_singleton(lua_state: *mut lua::lua_State, name: &'static str,
     lua::lua_newtable(lua_state);
     lua::lua_getfield(lua_state, lua::LUA_REGISTRYINDEX, meta_name.as_ptr() as _);
     lua::lua_setmetatable(lua_state, -2);
-    
+
     let global_table = lua::bindings::index2addr(lua_state, lua::LUA_REGISTRYINDEX);
     let table = (*global_table).value.ptr;
     let value = if *(table as *mut u32).add(3) < 2 {
@@ -307,39 +332,46 @@ unsafe fn push_new_singleton(lua_state: *mut lua::lua_State, name: &'static str,
     lua::bindings::auxsetstr(lua_state, value, real_name.as_ptr() as _);
 }
 
-
 #[skyline::hook(offset = 0x3373048, inline)]
 unsafe fn add_to_key_context(ctx: &skyline::hooks::InlineCtx) {
     let lua_state: *mut lua::lua_State = *ctx.registers[19].x.as_ref() as _;
     let registry = &[
         lua::luaL_Reg {
             name: "get_next_alt\0".as_ptr() as _,
-            func: Some(get_next_alt)
+            func: Some(get_next_alt),
+        },
+        lua::luaL_Reg {
+            name: "get_prev_alt\0".as_ptr() as _,
+            func: Some(get_prev_alt),
         },
         lua::luaL_Reg {
             name: "send_message\0".as_ptr() as _,
-            func: Some(send_message)
+            func: Some(send_message),
         },
         lua::luaL_Reg {
             name: "register_alt\0".as_ptr() as _,
-            func: Some(register_alt)
+            func: Some(register_alt),
         },
         lua::luaL_Reg {
             name: "get_index_for_texture\0".as_ptr() as _,
-            func: Some(get_index_for_texture)
+            func: Some(get_index_for_texture),
         },
         lua::luaL_Reg {
             name: "on_load\0".as_ptr() as _,
-            func: Some(on_load)
+            func: Some(on_load),
         },
         lua::luaL_Reg {
             name: "off_load\0".as_ptr() as _,
-            func: Some(off_load)
+            func: Some(off_load),
+        },
+        lua::luaL_Reg {
+            name: "set_stage_use_num\0".as_ptr() as _,
+            func: Some(set_stage_use_num),
         },
         lua::luaL_Reg {
             name: std::ptr::null(),
-            func: None
-        }
+            func: None,
+        },
     ];
     push_new_singleton(lua_state, "StageAltManager", registry);
 }
@@ -349,7 +381,7 @@ unsafe fn replace_texture(state: *mut lua::lua_State) -> i32 {
     if dbg!(lua::lua_isinteger(state, -1)) == 1 {
         let index = lua::lua_tointegerx(state, -1, std::ptr::null_mut()) as i32;
         lua::lua_pop(state, 1);
-        
+
         lua::lua_pushlightuserdata(state, &index as *const i32 as _);
         call_original!(state)
     } else {
@@ -360,7 +392,7 @@ unsafe fn replace_texture(state: *mut lua::lua_State) -> i32 {
 #[repr(C)]
 struct StageEntry {
     key: u64,
-    params: [f32; 4]
+    params: [f32; 4],
 }
 
 #[skyline::hook(offset = 0x1b31ca0)]
@@ -377,12 +409,8 @@ unsafe fn is_valid_entrance_param(arg: u64, arg2: i32) -> bool {
 }
 
 pub fn install() {
-    unsafe {
-        let _ = skyline::patching::nop_data(0x1d34e4c);
-    }
-    skyline::install_hooks!(
-        add_to_key_context,
-        replace_texture,
-        is_valid_entrance_param
-    );
+    // unsafe {
+    //     let _ = skyline::patching::nop_data(0x1d34e4c);
+    // }
+    skyline::install_hooks!(add_to_key_context, replace_texture, is_valid_entrance_param);
 }

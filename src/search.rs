@@ -1,10 +1,16 @@
+use log::error;
 use smash_arc::{
-    serde::Hash40String, ArcFile, ArcLookup, FolderPathListEntry, Hash40, HashToIndex,
+    serde::Hash40String, ArcFile, ArcLookup, FolderPathListEntry, Hash40, HashToIndex, LoadedArc,
     LoadedSearchSection, LookupError, PathListEntry, SearchLookup,
 };
 use std::collections::HashMap;
 
-use crate::{types::FilesystemInfo, StageAltFolder, StageAlts};
+use crate::{
+    alts::{StageAlt, StageAltInfo},
+    hash40_fmt,
+    types::FilesystemInfo,
+    Hash40Ext,
+};
 
 pub trait SearchEx: SearchLookup {
     fn get_folder_path_to_index_mut(&mut self) -> &mut [HashToIndex];
@@ -153,6 +159,25 @@ pub enum SearchEntry {
     },
 }
 
+pub trait FlattenVec {
+    fn flatten(self) -> Self;
+}
+
+impl FlattenVec for Vec<SearchEntry> {
+    fn flatten(self) -> Self {
+        let mut out = vec![];
+
+        for child in self {
+            match child {
+                SearchEntry::Folder { children, .. } => out.extend(children.flatten()),
+                other => out.push(other),
+            }
+        }
+
+        out
+    }
+}
+
 pub fn walk_search_section(
     search: &LoadedSearchSection,
     hash: Hash40,
@@ -267,12 +292,6 @@ fn get_child_referencing(search: &LoadedSearchSection, index: u32, child: Hash40
     None
 }
 
-macro_rules! hash40_fmt {
-    ($str:expr $(, $args:expr)*) => {
-        Hash40::from(format!($str $(, $args)*).as_str())
-    }
-}
-
 fn join_path<H1: Into<Hash40>, H2: Into<Hash40>>(parent: H1, child: H2) -> Hash40 {
     let parent = parent.into();
     let child = child.into();
@@ -293,136 +312,6 @@ fn concat<H1: Into<Hash40>, H2: Into<Hash40>>(first: H1, second: H2) -> Hash40 {
             .concat(smash::phx::Hash40::new_raw(second.as_u64()))
             .as_u64(),
     )
-}
-
-fn diff_folders(
-    search: &LoadedSearchSection,
-    arc: &ArcFile,
-    src: Hash40,
-    dst: Hash40,
-    dst_parent: Folder,
-) -> HashMap<Hash40String, NewFile> {
-    // we begin diffing by seeing if the dst folder *even exists*
-    // if it does not exist, then we are basically just gonna copy everything from src to our output
-    let children = walk_search_section(search, src, 1);
-
-    let path_index = search
-        .get_path_list_index_from_hash(dst)
-        .unwrap_or(0xFF_FFFF);
-
-    let mut new_files = HashMap::new();
-
-    for child in children {
-        match child {
-            SearchEntry::File(index) => {
-                // check if it is a vanilla file, if so then we can continue, otherwise
-                // we aren't going to try sharing to it
-                if arc
-                    .get_file_path_index_from_hash(
-                        search.get_path_list()[index as usize].path.hash40(),
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-
-                // get the path hash for this and see if it exists in dst
-                let name = search.get_path_list()[index as usize].file_name.hash40();
-
-                let exists = if path_index != 0xFF_FFFF {
-                    get_direct_child(search, path_index, name).is_some()
-                } else {
-                    false
-                };
-
-                if !exists {
-                    new_files.insert(
-                        Hash40String(search.get_path_list()[index as usize].path.hash40()),
-                        NewFile {
-                            full_path: Hash40String(join_path(dst, name)),
-                            file_name: Hash40String(name),
-                            parent: dst_parent.clone(),
-                            extension: Hash40String(
-                                search.get_path_list()[index as usize].ext.hash40(),
-                            ),
-                        },
-                    );
-                }
-            }
-            SearchEntry::Folder { index, .. } => {
-                let name = search.get_path_list()[index as usize].file_name.hash40();
-
-                // let exists = if path_index != 0xFF_FFFF {
-                //     println!("getting child");
-                //     std::thread::sleep(std::time::Duration::from_millis(100));
-                //     let child = get_direct_child(search, path_index, name).is_some();
-                //     println!("gotten child");
-                //     child
-                // } else {
-                //     false
-                // };
-
-                // if !exists {
-                let new_parent = Folder {
-                    full_path: Hash40String(join_path(dst, name)),
-                    name: Some(Hash40String(name)),
-                    parent: Some(Box::new(dst_parent.clone())),
-                };
-
-                new_files.extend(diff_folders(
-                    search,
-                    arc,
-                    search.get_path_list()[index as usize].path.hash40(),
-                    join_path(dst, name),
-                    new_parent,
-                ));
-
-                // }
-            }
-        }
-    }
-
-    new_files
-}
-
-fn collect_alts(
-    search: &LoadedSearchSection,
-    base_path: Hash40,
-    index: u32,
-    alt_no: usize,
-) -> Vec<StageAltFolder> {
-    let hash = search.get_path_list()[index as usize].path.hash40();
-    let walked = walk_search_section(search, hash, 1);
-
-    let mut self_alt = StageAltFolder::new(alt_no, base_path, hash);
-
-    let mut alts = vec![];
-
-    for child in walked {
-        match child {
-            SearchEntry::File(index) => {
-                let child = &search.get_path_list()[index as usize];
-                self_alt.add_file(child.file_name.hash40());
-            }
-            SearchEntry::Folder { index, .. } => {
-                let child = &search.get_path_list()[index as usize];
-                let new_base_path = Hash40(
-                    smash::phx::Hash40::new_raw(base_path.0)
-                        .concat(smash::phx::Hash40::new("/"))
-                        .concat(smash::phx::Hash40::new_raw(child.file_name.hash40().0))
-                        .as_u64(),
-                );
-
-                alts.extend(collect_alts(search, new_base_path, index, alt_no));
-            }
-        }
-    }
-
-    if !self_alt.files().is_empty() {
-        alts.push(self_alt);
-    }
-
-    alts
 }
 
 fn file_order_fix(search: &mut LoadedSearchSection, src: Hash40, dst: Hash40) {
@@ -522,332 +411,335 @@ fn file_order_fix(search: &mut LoadedSearchSection, src: Hash40, dst: Hash40) {
         .set_index(0xFF_FFFF);
 }
 
-fn fix_order_specific_files(search: &mut LoadedSearchSection) {
-    let mut counter = 1;
-    let index = search
-        .get_path_list_index_from_hash("stage/poke_stadium2")
-        .unwrap();
-    while let Some(alt_index) =
-        get_direct_child(search, index, hash40_fmt!("normal_s{:02}", counter))
-    {
-        let Some(param_folder) = get_direct_child(search, alt_index, Hash40::from("param")) else { 
-            counter += 1;
-            continue;
-        };
-        let Some(referencing) = get_child_referencing(search, param_folder, Hash40::from("xstadium_00.lvd")) else {
-            counter += 1;
-            continue;
-        };
+fn collect_folders(search: &LoadedSearchSection, path: Hash40, mut base: Hash40) -> Vec<Hash40> {
+    let children = walk_search_section(search, path, 1);
 
-        if referencing == 0xFF_FFFF {
-            counter += 1;
-            continue;
-        }
-
-        let lvd_index = search.get_path_list()[referencing as usize].path.index();
-        let lvd_next = search.get_path_list()[lvd_index as usize].path.index();
-
-        let first_child_index = {
-            let parent_hash = search.get_path_list()[param_folder as usize].path.hash40();
-            let folder = search
-                .get_folder_path_entry_from_hash_mut(parent_hash)
-                .unwrap();
-            let prev = folder.get_first_child_index();
-            folder.set_first_child_index(lvd_index);
-            prev as u32
-        };
-        search.get_path_list_mut()[referencing as usize]
-            .path
-            .set_index(lvd_next);
-        search.get_path_list_mut()[lvd_index as usize]
-            .path
-            .set_index(first_child_index);
-        counter += 1;
+    if base != Hash40(0) {
+        base = base.concat("/");
     }
+
+    let mut out = vec![];
+    for child in children {
+        let SearchEntry::Folder { index, .. } = child else {
+            continue;
+        };
+
+        let path = search.get_path_list()[index as usize];
+        let next_path = base.concat(path.file_name.hash40());
+        out.push(next_path);
+
+        out.extend(collect_folders(search, path.path.hash40(), next_path));
+    }
+
+    out
 }
 
-fn get_eff_folder_from_stage(stage: Hash40) -> Hash40 {
-    join_path("effect/stage", stage)
-}
-
-fn get_eff_name_from_stage(stage: Hash40, alt: usize) -> Hash40 {
-    if alt == 0 {
-        concat(concat("ef_", stage), ".eff")
+fn get_ui_files(stage_name: Hash40, alt_no: usize) -> [Hash40; 5] {
+    let replace_path = if crate::alts::StageAltManager::is_dlc_stage(stage_name) {
+        Hash40::from("ui/replace_patch/stage")
     } else {
-        concat(concat("ef_", stage), hash40_fmt!("_s{:02}.eff", alt))
+        Hash40::from("ui/replace/stage")
+    };
+
+    let stage_name = if stage_name == Hash40::from("battlefield_s") {
+        Hash40::from("battlefields")
+    } else if stage_name == Hash40::from("battlefield_l") {
+        Hash40::from("battlefieldl")
+    } else {
+        stage_name
+    };
+
+    let suffix = if alt_no == 0 {
+        Hash40::from(".bntx")
+    } else {
+        hash40_fmt!("_s{:02}.bntx", alt_no)
+    };
+
+    [
+        replace_path
+            .join_path("stage_0")
+            .join_path("stage_0_")
+            .concat(stage_name)
+            .concat(suffix),
+        replace_path
+            .join_path("stage_1")
+            .join_path("stage_1_")
+            .concat(stage_name)
+            .concat(suffix),
+        replace_path
+            .join_path("stage_2")
+            .join_path("stage_2_")
+            .concat(stage_name)
+            .concat(suffix),
+        replace_path
+            .join_path("stage_3")
+            .join_path("stage_3_")
+            .concat(stage_name)
+            .concat(suffix),
+        replace_path
+            .join_path("stage_4")
+            .join_path("stage_4_")
+            .concat(stage_name)
+            .concat(suffix),
+    ]
+}
+
+fn collect_sharing_base(
+    arc: &LoadedArc,
+    search: &LoadedSearchSection,
+    folder_lookup: &HashMap<Hash40, Hash40>,
+) -> HashMap<Hash40, (u32, u32)> {
+    let mut out = HashMap::new();
+    for (base, modded) in folder_lookup.iter() {
+        let files: Vec<u32> = walk_search_section(search, *modded, 1)
+            .into_iter()
+            .filter_map(|entry| {
+                if let SearchEntry::File(idx) = entry {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for file in files {
+            let name = search.get_path_list()[file as usize].file_name.hash40();
+            let base_path = base.join_path(name);
+            let modded_path = modded.join_path(name);
+
+            let Ok(base_fp_index) = arc.get_file_path_index_from_hash(base_path) else {
+                continue;
+            };
+            let modded_fp_index = arc.get_file_path_index_from_hash(modded_path).unwrap();
+
+            let file_paths = arc.get_file_paths();
+            if file_paths[base_fp_index].path.index() != file_paths[modded_fp_index].path.index() {
+                out.insert(
+                    base_path,
+                    (
+                        file_paths[base_fp_index].path.index(),
+                        file_paths[modded_fp_index].path.index(),
+                    ),
+                );
+            }
+        }
     }
+    out
 }
 
-fn get_eff_path_from_stage(stage: Hash40, alt: usize) -> Hash40 {
-    join_path(
-        get_eff_folder_from_stage(stage),
-        get_eff_name_from_stage(stage, alt),
-    )
-}
-
-pub fn collect_stage_alts() -> StageAlts {
-    fix_order_specific_files(FilesystemInfo::instance_mut().unwrap().search_mut());
-
+pub fn collect_alts() {
+    // Acquire a mutable and immutable reference
+    // This is a really bad practice but if we are careful it's fine
     let search = FilesystemInfo::instance().unwrap().search();
     let search_mut = FilesystemInfo::instance_mut().unwrap().search_mut();
 
-    let stage = walk_search_section(search, Hash40::from("stage"), 1);
+    // Also acquire a reference to the arc
+    // We use this to do unsharing and resharing on the fly
+    let arc = FilesystemInfo::instance().unwrap().arc();
 
-    let mut missing_files: HashMap<Hash40String, Vec<NewFile>> = HashMap::new();
-    let mut alts = StageAlts::new();
+    // Collect all of the stage folders in the stage directory, we are going to check them on a case by case basis for stage alts
+    let stage_folders = walk_search_section(search, Hash40::from("stage"), 1);
 
-    let arc = ArcFile::open("rom:/data.arc").unwrap();
+    let mut alt_infos = HashMap::new();
+    let mut total_alts = vec![];
 
-    for child in stage {
-        let SearchEntry::Folder { index, .. } = child else { continue; };
-
-        let path = &search.get_path_list()[index as usize];
-        if path.file_name.hash40() == Hash40::from("common") {
-            continue;
-        }
-
-        if let Some(normal) = get_direct_child(search, index, Hash40::from("normal")) {
-            let mut counter = 1;
-            while let Some(alt) =
-                get_direct_child(search, index, hash40_fmt!("normal_s{:02}", counter))
-            {
-                let name = search.get_path_list()[index as usize].file_name.hash40();
-                {
-                    let parent_base = Folder {
-                        full_path: Hash40String(search.get_path_list()[alt as usize].path.hash40()),
-                        name: None,
-                        parent: None,
-                    };
-
-                    let missing = diff_folders(
-                        search,
-                        &arc,
-                        search.get_path_list()[normal as usize].path.hash40(),
-                        parent_base.full_path.0,
-                        parent_base,
-                    );
-
-                    // only do this if missing is empty, since otherwise we are restarting and
-                    // this is a pointless step
-                    if missing.is_empty() {
-                        file_order_fix(
-                            search_mut,
-                            search.get_path_list()[normal as usize].path.hash40(),
-                            search.get_path_list()[alt as usize].path.hash40(),
-                        );
-                    }
-
-                    'outer: for (k, v) in missing {
-                        if let Some(list) = missing_files.get_mut(&k) {
-                            for file in list.iter() {
-                                if file.full_path == v.full_path {
-                                    continue 'outer;
-                                }
-                            }
-                            list.push(v);
-                        } else {
-                            missing_files.insert(k, vec![v]);
-                        }
-                    }
-                }
-
-                let base_path = search.get_path_list()[normal as usize].path.hash40();
-                let mut alt_list = collect_alts(search, base_path, alt, counter);
-
-                let mut effect_alt = StageAltFolder::new(
-                    counter as usize,
-                    get_eff_folder_from_stage(name),
-                    get_eff_folder_from_stage(name),
-                );
-
-                effect_alt.add_file(get_eff_name_from_stage(name, counter));
-
-                alt_list.push(effect_alt);
-
-                for alt in alt_list {
-                    alts.add_alt(alt.base_path, alt);
-                }
-
-                counter += 1;
-            }
-            alts.set_available_normal(path.file_name.hash40(), counter);
-        }
-
-        if let Some(battle) = get_direct_child(search, index, Hash40::from("battle")) {
-            let mut counter = 1;
-            while let Some(alt) =
-                get_direct_child(search, index, hash40_fmt!("battle_s{:02}", counter))
-            {
-                let name = search.get_path_list()[index as usize].file_name.hash40();
-                {
-                    let parent_base = Folder {
-                        full_path: Hash40String(search.get_path_list()[alt as usize].path.hash40()),
-                        name: None,
-                        parent: None,
-                    };
-
-                    let missing = diff_folders(
-                        search,
-                        &arc,
-                        search.get_path_list()[battle as usize].path.hash40(),
-                        parent_base.full_path.0,
-                        parent_base,
-                    );
-
-                    // only do this if missing is empty, since otherwise we are restarting and
-                    // this is a pointless step
-                    if missing.is_empty() {
-                        file_order_fix(
-                            search_mut,
-                            search.get_path_list()[battle as usize].path.hash40(),
-                            search.get_path_list()[alt as usize].path.hash40(),
-                        );
-                    }
-
-                    'outer: for (k, v) in missing {
-                        if let Some(list) = missing_files.get_mut(&k) {
-                            for file in list.iter() {
-                                if file.full_path == v.full_path {
-                                    continue 'outer;
-                                }
-                            }
-                            list.push(v);
-                        } else {
-                            missing_files.insert(k, vec![v]);
-                        }
-                    }
-                }
-
-                let base_path = search.get_path_list()[battle as usize].path.hash40();
-                let mut alt_list = collect_alts(search, base_path, alt, counter);
-
-                let mut effect_alt = StageAltFolder::new(
-                    counter as usize,
-                    get_eff_folder_from_stage(name),
-                    get_eff_folder_from_stage(name),
-                );
-
-                effect_alt.add_file(get_eff_name_from_stage(name, counter));
-
-                if alts
-                    .get_alt(effect_alt.base_path, effect_alt.alt_no)
-                    .is_none()
-                {
-                    alt_list.push(effect_alt);
-                }
-
-                for alt in alt_list {
-                    alts.add_alt(alt.base_path, alt);
-                }
-
-                counter += 1;
-            }
-            alts.set_available_battle(path.file_name.hash40(), counter);
-        }
-    }
-
-    let effect_dir = arc.get_dir_info_from_hash("effect/stage").unwrap();
-    let children = &arc.file_system.folder_child_hashes[effect_dir.children_range()];
-
-    for effect_child in children {
-        let Ok(path) = search.get_path_list_entry_from_hash(effect_child.hash40()) else {
+    for stage in stage_folders {
+        // stage folder entries must be folders
+        let SearchEntry::Folder { index: stage_folder_index, .. } = stage else {
+            error!("File encountered in stage folder!");
             continue;
         };
 
-        let max = alts
-            .max_normal(path.file_name.hash40())
-            .max(alts.max_battle(path.file_name.hash40()));
+        // go ahead and get the actual path entry since we are going to be using it a bit
+        let stage_path = search.get_path_list()[stage_folder_index as usize];
 
-        for counter in 1..max {
-            let new_path = join_path(
-                path.parent.hash40(),
-                concat(path.file_name.hash40(), hash40_fmt!("_s{:02}", counter)),
-            );
-            let missing = diff_folders(
-                search,
-                &arc,
-                path.path.hash40(),
-                new_path,
-                Folder {
-                    full_path: Hash40String(new_path),
-                    name: Some(Hash40String(concat(
-                        path.file_name.hash40(),
-                        hash40_fmt!("_s{:02}", counter),
-                    ))),
-                    parent: Some(Box::new(Folder {
-                        full_path: Hash40String(path.parent.hash40()),
-                        name: None,
-                        parent: None,
-                    })),
-                },
-            );
-
-            if missing.is_empty() {
-                file_order_fix(search_mut, path.path.hash40(), new_path);
-            } else {
-                println!("{:#x?}", missing);
-            }
-
-            if let Ok(index) = search.get_path_list_index_from_hash(new_path) {
-                let alt_paths = collect_alts(search, path.path.hash40(), index, counter);
-                for alt in alt_paths {
-                    for file in alt.files() {
-                        println!("{:#x}", alt.new_path(*file).0);
-                    }
-                    println!("----------");
-                    alts.add_alt(alt.base_path, alt);
-                }
-            }
-
-            'outer: for (k, v) in missing {
-                if let Some(list) = missing_files.get_mut(&k) {
-                    for file in list.iter() {
-                        if file.full_path == v.full_path {
-                            continue 'outer;
-                        }
-                    }
-                    list.push(v);
-                } else {
-                    missing_files.insert(k, vec![v]);
-                }
-            }
+        // move on to the next folder if this one is common, there are no alts to be had on common
+        if stage_path.file_name.hash40() == Hash40::from("common") {
+            continue;
         }
+
+        // We attempt to get the normal path. This one is unconditional because every stage must have a normal folder, even battlefield
+        let Some(normal_path) = get_direct_child(search, stage_folder_index, Hash40::from("normal")).map(|index| search.get_path_list()[index as usize]) else {
+            error!("Stage {:#x} did not have normal folder!", stage_path.file_name.hash40().0);
+            continue;
+        };
+
+        // We get the battle path if it exists, it does not exist for boss stages (iirc?) and small bf, big bf, and fd
+        let battle_path = get_direct_child(search, stage_folder_index, Hash40::from("battle"))
+            .map(|index| search.get_path_list()[index as usize]);
+
+        let mut alts = vec![];
+        for x in 0..100 {
+            // If there is no normal alt then there definitely won't be a battlefield alt
+            // Even for battlefield form only mods there will still be a normal alt it will just be the vanilla stage
+            let Some(normal_alt_index) = get_direct_child(search, stage_folder_index, hash40_fmt!("normal_s{:02}", x)) else {
+                continue;
+            };
+
+            let normal_alt = search.get_path_list()[normal_alt_index as usize];
+
+            let is_normal_ws =
+                get_direct_child(search, normal_alt_index, Hash40::from("wifi-safe.flag"))
+                    .is_some();
+            let is_normal_ignore =
+                get_direct_child(search, normal_alt_index, Hash40::from("wifi-ignore.flag"))
+                    .is_some();
+
+            // When we get here, we know that we have an alt. So we are going to first collect the UI paths and the effect folder. Makes the most sense to do these
+            // as they don't require any discovery -- they are static paths.
+
+            // The effect path is handled on a folder basis to ensure that in the off-chance that any stage effect folder has more than just a .eff
+            // that it's going to be handled, but even if that isn't the case it enables not colliding with one-slot effects.
+            let mut folder_lookup = HashMap::new();
+            folder_lookup.insert(
+                Hash40::from("effect/stage").join_path(stage_path.file_name.hash40()),
+                Hash40::from("effect/stage")
+                    .join_path(stage_path.file_name.hash40())
+                    .concat(hash40_fmt!("_s{:02}", x)),
+            );
+
+            // The UI files are also static and can just be generated.
+            let ui_files = get_ui_files(stage_path.file_name.hash40(), x);
+
+            // Perform the file order fix on the normal section
+            // This is a very important step, as often the search section will walk through the children and find the first file with a certain extension. In vanilla, these are all formatted
+            // via alphabetical order, so a file like `poke_stadium2_00.lvd` will be detected before `poke_stadium2_01.lvd`
+            // SAFETY: Upon reaching this point, having any immutable references to the search section is considered invalid, so don't do that. All of our indices/state
+            // at this point is managed via indices.
+            file_order_fix(
+                search_mut,
+                normal_path.path.hash40(),
+                normal_alt.path.hash40(),
+            );
+
+            // We are using the regular stage normal path here to collect these because we can use that to detect
+            // if there is something missing when loading the stage alt. Allows us to display a panic error message instead
+            // of just crashing a little bit later, or the user having unintended effects
+            //
+            // Note: Each of these paths are relative to the normal path, meaning we will get paths like `model/floating_plate_set`, which is dope
+            // because it means we can join it against our roots separately without having to rediscover
+            let folders = collect_folders(search, normal_path.path.hash40(), Hash40::from(""));
+
+            // We create our folder lookup here, this is going to become part of the stage alt.
+            for folder in folders {
+                folder_lookup.insert(
+                    normal_path.path.hash40().join_path(folder),
+                    normal_alt.path.hash40().join_path(folder),
+                );
+            }
+
+            // do the same thing for the battle paths if they exist
+            let mut is_battle_ws = false;
+            let mut is_battle_ignore = false;
+            'battle: {
+                let Some(battle_path) = battle_path else {
+                    break 'battle;
+                };
+
+                let Some(battle_alt_index) = get_direct_child(search, stage_folder_index, hash40_fmt!("battle_s{:02}", x)) else {
+                    error!("The battlefield form alt for {:#x} was not discovered even thought it is erquired.", stage_path.file_name.hash40().0);
+                    break 'battle;
+                };
+
+                let battle_alt = search.get_path_list()[battle_alt_index as usize];
+
+                is_battle_ws =
+                    get_direct_child(search, battle_alt_index, Hash40::from("wifi-safe.flag"))
+                        .is_some();
+                is_battle_ignore =
+                    get_direct_child(search, battle_alt_index, Hash40::from("wifi-ignore.flag"))
+                        .is_some();
+
+                file_order_fix(
+                    search_mut,
+                    battle_path.path.hash40(),
+                    battle_alt.path.hash40(),
+                );
+
+                let folders = collect_folders(search, battle_path.path.hash40(), Hash40::from(""));
+
+                for folder in folders {
+                    folder_lookup.insert(
+                        battle_path.path.hash40().join_path(folder),
+                        battle_alt.path.hash40().join_path(folder),
+                    );
+                }
+            }
+
+            let sharing_base = collect_sharing_base(arc, search, &folder_lookup);
+
+            alts.push(std::sync::Arc::new(StageAlt {
+                alt_folders: folder_lookup,
+                sharing_base,
+                ui_paths: ui_files,
+                is_normal_ws,
+                is_normal_ignore,
+                is_battle_ws,
+                is_battle_ignore,
+            }));
+        }
+
+        if !alts.is_empty() {
+            let mut folder_lookup = HashMap::new();
+            folder_lookup.insert(
+                Hash40::from("effect/stage").join_path(stage_path.file_name.hash40()),
+                Hash40::from("effect/stage").join_path(stage_path.file_name.hash40()),
+            );
+
+            let ui_files = get_ui_files(stage_path.file_name.hash40(), 0);
+            let folders = collect_folders(search, normal_path.path.hash40(), Hash40::from(""));
+
+            folder_lookup.extend(folders.into_iter().map(|path| {
+                (
+                    normal_path.path.hash40().join_path(path),
+                    normal_path.path.hash40().join_path(path),
+                )
+            }));
+
+            if let Some(battle_path) = battle_path {
+                let folders = collect_folders(search, battle_path.path.hash40(), Hash40::from(""));
+
+                folder_lookup.extend(folders.into_iter().map(|path| {
+                    (
+                        battle_path.path.hash40().join_path(path),
+                        battle_path.path.hash40().join_path(path),
+                    )
+                }));
+            }
+
+            alts.insert(
+                0,
+                std::sync::Arc::new(StageAlt {
+                    alt_folders: folder_lookup,
+                    sharing_base: HashMap::new(),
+                    ui_paths: ui_files,
+                    is_normal_ws: true,
+                    is_normal_ignore: false,
+                    is_battle_ws: true,
+                    is_battle_ignore: false,
+                }),
+            );
+        }
+
+        let stage_name = stage_path.file_name.hash40();
+
+        let mut alt_info = StageAltInfo {
+            stage_name,
+            stage_folder: stage_path.path.hash40(),
+            normal_folder: stage_path.path.hash40().join_path("normal"),
+            battle_folder: stage_path.path.hash40().join_path("battle"),
+            alts_found: vec![],
+        };
+
+        for alt in alts {
+            alt_info.alts_found.push(alt.clone());
+            total_alts.push(alt);
+        }
+
+        alt_infos.insert(alt_info.stage_name, alt_info);
     }
 
-    if !missing_files.is_empty() {
-        let mut auto_cfg = config::AutoCfg::open().unwrap();
-
-        for (k, v) in missing_files.into_iter() {
-            for file in v {
-                match auto_cfg.merge(k.0, file) {
-                    MergeResult::AlreadyThere => {
-                        skyline_web::DialogOk::ok(
-                            "Please make sure that Stage-Alts-Auto-Cfg is enabled via ARCropolis",
-                        );
-                        unsafe {
-                            skyline::nn::oe::RequestToRelaunchApplication();
-                        }
-                    }
-                    MergeResult::Merged => {}
-                }
-            }
-        }
-
-        auto_cfg.save().unwrap();
-
-        skyline_web::DialogOk::ok(
-            "The stage alts auto config has been updated, please restart your game!",
-        );
-        unsafe {
-            skyline::nn::oe::RequestToRelaunchApplication();
-        }
-
-        // let string = serde_json::to_string_pretty(&SimpleConfigJson { new_shared_files: missing_files }).unwrap();
-
-        // std::fs::write("sd:/ultimate/mods/Stage-Alts-Auto-Cfg/config.json", string).unwrap();
-    }
-
-    // println!("{:#x?}", missing_files);
-
-    alts
+    let mut mgr = crate::alts::get_mut();
+    mgr.alt_infos = alt_infos;
+    mgr.alts = total_alts;
 }

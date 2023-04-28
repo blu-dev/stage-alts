@@ -542,10 +542,10 @@ local switch_stage_form = function(preview_index, stage_form)
     if preview.alt_id_ ~= 0 then
         if preview.panel_id_ == UI_INVALID_INDEX then
             StageAltManager.send_message("invalid index")
-            next_alt = StageAltManager.get_next_alt(current_selected_panel, stage_form, preview.alt_id_ - 1)
+            next_alt = StageAltManager.get_next_alt(current_selected_panel, preview.alt_id_ - 1, stage_form)
         else
             StageAltManager.send_message("valid index")
-            next_alt = StageAltManager.get_next_alt(preview.panel_id_, stage_form, preview.alt_id_ - 1)
+            next_alt = StageAltManager.get_next_alt(preview.panel_id_, preview.alt_id_ - 1, stage_form)
         end
     end
     if preview.panel_id_ == UI_INVALID_INDEX then
@@ -1350,13 +1350,20 @@ local cycle_stage_form = function()
     end
 end
 
-local advance_stage_alt = function()
+local advance_stage_alt = function(direction)
     if tab_index ~= TAB_SWITCH_NORMAL then
         return
     end
 
     local preview = stage_previews[current_selected_preview + 1]
-    local next_alt = StageAltManager.get_next_alt(current_selected_panel, preview.form_type_, preview.alt_id_)
+    local next_alt = nil
+    if direction == 1 then
+        next_alt = StageAltManager.get_next_alt(current_selected_panel, preview.alt_id_, preview.form_type_)
+    elseif direction == -1 then
+        next_alt = StageAltManager.get_prev_alt(current_selected_panel, preview.alt_id_, preview.form_type_)
+    else
+        return
+    end
     if next_alt ~= preview.alt_id_ then
         set_alt_preview(current_selected_preview, current_selected_panel, preview.form_type_, next_alt)
         UiSoundManager.play_se_label("se_system_switch")
@@ -2229,7 +2236,9 @@ local regular_main_update = function()
                         open_bgm_select(index, false)
                     elseif virtual_input:is_pressed(VI_BUTTON_EXTRA29) == true then
                         StageAltManager.send_message("btn pressed")
-                        advance_stage_alt()
+                        advance_stage_alt(1)
+                    elseif virtual_input:is_pressed(VI_BUTTON_EXTRA28) == true then
+                        advance_stage_alt(-1)
                     else
                         update_both_tabs()
                     end
@@ -2306,6 +2315,7 @@ end
 
 main = function()
     StageAltManager.on_load()
+    StageAltManager.set_stage_use_num(USE_STAGE_NUM)
     setup()
     stage_select_bgm:setup()
     setup_from_environment()
